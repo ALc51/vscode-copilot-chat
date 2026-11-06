@@ -18,8 +18,9 @@ import { ContextManagementResponse } from '../../networking/common/anthropic';
 import { FinishedCallback, OpenAiFunctionTool, OptionalChatRequestParams } from '../../networking/common/fetch';
 import { Response } from '../../networking/common/fetcherService';
 import { IChatEndpoint, ICreateEndpointBodyOptions, IEndpointBody, IMakeChatRequestOptions } from '../../networking/common/networking';
-import { ChatCompletion } from '../../networking/common/openai';
-import { IOTelService } from '../../otel/common/otelService';
+import { APIUsage, ChatCompletion } from '../../networking/common/openai';
+import { GenAiAttr, GenAiOperationName, truncateForOTel } from '../../otel/common/index';
+import { IOTelService, ISpanHandle, SpanKind, SpanStatusCode } from '../../otel/common/otelService';
 import { retrieveCapturingTokenByCorrelation, storeCapturingTokenForCorrelation } from '../../requestLogger/node/requestLogger';
 import { ITelemetryService } from '../../telemetry/common/telemetry';
 import { TelemetryData } from '../../telemetry/common/telemetryData';
@@ -27,6 +28,7 @@ import { EndpointEditToolName, isEndpointEditToolName } from '../common/endpoint
 import { CustomDataPartMimeTypes } from '../common/endpointTypes';
 import { decodeStatefulMarker, encodeStatefulMarker, rawPartAsStatefulMarker } from '../common/statefulMarkerContainer';
 import { rawPartAsThinkingData } from '../common/thinkingDataContainer';
+import { isCopilotBuiltinByokVendor } from './builtinByokVendors';
 import { ExtensionContributedChatTokenizer } from './extChatTokenizer';
 
 enum ChatImageMimeType {
@@ -35,6 +37,69 @@ enum ChatImageMimeType {
 	GIF = 'image/gif',
 	WEBP = 'image/webp',
 	BMP = 'image/bmp',
+}
+
+/**
+ * Parse usage from a LanguageModelDataPart by JSON shape (not MIME).
+ * Third-party providers commonly emit OpenAI-style usage payloads.
+ */
+export function usageFromDataPart(part: vscode.LanguageModelDataPart): APIUsage | undefined {
+	try {
+		const parsed = JSON.parse(new TextDecoder().decode(part.data)) as {
+			prompt_tokens?: unknown;
+			completion_tokens?: unknown;
+			total_tokens?: unknown;
+			prompt_tokens_details?: unknown;
+			completion_tokens_details?: unknown;
+		};
+
+		if (
+			typeof parsed.prompt_tokens === 'number' &&
+			typeof parsed.completion_tokens === 'number' &&
+			typeof parsed.total_tokens === 'number'
+		) {
+			const usage: APIUsage = {
+				prompt_tokens: parsed.prompt_tokens,
+				completion_tokens: parsed.completion_tokens,
+				total_tokens: parsed.total_tokens,
+				prompt_tokens_details:
+					parsed.prompt_tokens_details && typeof parsed.prompt_tokens_details === 'object'
+						? (parsed.prompt_tokens_details as APIUsage['prompt_tokens_details'])
+						: { cached_tokens: 0 },
+			};
+
+			if (parsed.completion_tokens_details && typeof parsed.completion_tokens_details === 'object') {
+				usage.completion_tokens_details = parsed.completion_tokens_details as APIUsage['completion_tokens_details'];
+			}
+
+			return usage;
+		}
+	} catch {
+		// Ignore non-JSON or non-usage DataParts.
+	}
+
+	return undefined;
+}
+
+function rawMessagesForOTel(messages: Raw.ChatMessage[]): unknown[] {
+	const roleNames: Record<number, string> = {
+		[Raw.ChatRole.System]: 'system',
+		[Raw.ChatRole.User]: 'user',
+		[Raw.ChatRole.Assistant]: 'assistant',
+		[Raw.ChatRole.Tool]: 'tool',
+	};
+	return messages.map(message => {
+		const textParts: string[] = [];
+		for (const part of message.content) {
+			if (part.type === Raw.ChatCompletionContentPartKind.Text) {
+				textParts.push(part.text);
+			}
+		}
+		return {
+			role: roleNames[message.role] ?? String(message.role),
+			parts: [{ type: 'text', content: textParts.length > 0 ? textParts.join('') : '[non-text content]' }],
+		};
+	});
 }
 
 export class ExtensionContributedChatEndpoint implements IChatEndpoint {
@@ -172,11 +237,13 @@ export class ExtensionContributedChatEndpoint implements IChatEndpoint {
 		const ourRequestId = generateUuid();
 
 		// Capture active OTel trace context to propagate through IPC to the BYOK provider.
-		// Each provider creates its own chat span with full usage data:
+		// Built-in BYOK providers create their own chat span with full usage data:
 		// - OpenAI-compatible (Azure, OpenAI, etc.): via CopilotLanguageModelWrapper → chatMLFetcher
 		// - Anthropic: inside AnthropicLMProvider
 		// - Gemini: inside GeminiNativeBYOKLMProvider
+		// Third-party languageModelChatProviders do not, so we create a fallback span below.
 		const activeTraceCtx = this._otelService.getActiveTraceContext();
+		const createFallbackSpan = !isCopilotBuiltinByokVendor(this.languageModel.vendor);
 
 		const vscodeOptions: vscode.LanguageModelChatRequestOptions = {
 			tools: ((requestOptions?.tools ?? []) as OpenAiFunctionTool[]).map(tool => ({
@@ -191,12 +258,29 @@ export class ExtensionContributedChatEndpoint implements IChatEndpoint {
 			}
 		};
 
-		// Store current CapturingToken for retrieval by BYOK providers after IPC crossing
-		//
-		// Note: We intentionally don't create an OTel chat span here for extension-contributed models.
-		// The BYOK provider (CopilotLanguageModelWrapper) creates the real chat span via chatMLFetcher
-		// with full token usage, response model, and cache data. Creating a span here would duplicate it.
 		storeCapturingTokenForCorrelation(ourRequestId);
+
+		let otelSpan: ISpanHandle | undefined;
+		if (createFallbackSpan) {
+			otelSpan = this._otelService.startSpan(`chat ${this.languageModel.id}`, {
+				kind: SpanKind.CLIENT,
+				attributes: {
+					[GenAiAttr.OPERATION_NAME]: GenAiOperationName.CHAT,
+					[GenAiAttr.PROVIDER_NAME]: this.languageModel.vendor || '3p-extension',
+					[GenAiAttr.REQUEST_MODEL]: this.languageModel.id,
+					[GenAiAttr.AGENT_NAME]: debugName || 'ExtensionContributedLM',
+					[GenAiAttr.CONVERSATION_ID]: ourRequestId,
+				},
+				parentTraceContext: activeTraceCtx,
+			});
+			if (this._otelService.config.captureContent) {
+				try {
+					otelSpan.setAttribute(GenAiAttr.INPUT_MESSAGES, truncateForOTel(JSON.stringify(rawMessagesForOTel(messages))));
+				} catch {
+					// Ignore content capture failures.
+				}
+			}
+		}
 
 		const streamRecorder = new FetchStreamRecorder(finishedCb);
 
@@ -204,6 +288,8 @@ export class ExtensionContributedChatEndpoint implements IChatEndpoint {
 			const response = await this.languageModel.sendRequest(vscodeMessages, vscodeOptions, token);
 			let text = '';
 			let numToolsCalled = 0;
+			let usage: APIUsage | undefined;
+			const toolCallParts: Array<{ type: 'tool_call'; id: string; name: string; arguments: unknown }> = [];
 			const requestId = ourRequestId;
 
 			// consume stream
@@ -221,6 +307,12 @@ export class ExtensionContributedChatEndpoint implements IChatEndpoint {
 							id: tool.callId
 						}));
 						numToolsCalled++;
+						toolCallParts.push({
+							type: 'tool_call',
+							id: chunk.callId,
+							name: chunk.name ?? '',
+							arguments: chunk.input,
+						});
 						await streamRecorder.callback(text, 0, { text: '', copilotToolCalls: functionCalls });
 					}
 				} else if (chunk instanceof vscode.LanguageModelDataPart) {
@@ -230,6 +322,11 @@ export class ExtensionContributedChatEndpoint implements IChatEndpoint {
 					} else if (chunk.mimeType === CustomDataPartMimeTypes.ContextManagement) {
 						const contextManagement = JSON.parse(new TextDecoder().decode(chunk.data)) as ContextManagementResponse;
 						await streamRecorder.callback?.(text, 0, { text: '', contextManagement });
+					}
+					// Mirror native usage-only chunk handling by shape, not MIME.
+					const maybeUsage = usageFromDataPart(chunk);
+					if (maybeUsage) {
+						usage = maybeUsage;
 					}
 				} else if (chunk instanceof vscode.LanguageModelThinkingPart) {
 					if (streamRecorder.callback) {
@@ -245,12 +342,37 @@ export class ExtensionContributedChatEndpoint implements IChatEndpoint {
 				}
 			}
 
+			const resolvedUsage = usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } };
+
+			if (otelSpan) {
+				otelSpan.setAttributes({
+					[GenAiAttr.RESPONSE_MODEL]: this.languageModel.id,
+					[GenAiAttr.RESPONSE_ID]: requestId,
+					[GenAiAttr.USAGE_INPUT_TOKENS]: resolvedUsage.prompt_tokens,
+					[GenAiAttr.USAGE_OUTPUT_TOKENS]: resolvedUsage.completion_tokens,
+					[GenAiAttr.USAGE_CACHE_READ_INPUT_TOKENS]: resolvedUsage.prompt_tokens_details?.cached_tokens ?? 0,
+				});
+				if (this._otelService.config.captureContent) {
+					try {
+						const parts: Array<{ type: string; content?: string; id?: string; name?: string; arguments?: unknown }> = [];
+						if (text) {
+							parts.push({ type: 'text', content: text });
+						}
+						parts.push(...toolCallParts);
+						otelSpan.setAttribute(GenAiAttr.OUTPUT_MESSAGES, truncateForOTel(JSON.stringify([{ role: 'assistant', parts }])));
+					} catch {
+						// Ignore content capture failures.
+					}
+				}
+				otelSpan.setStatus(text || numToolsCalled > 0 ? SpanStatusCode.OK : SpanStatusCode.ERROR, text || numToolsCalled > 0 ? undefined : 'No response from language model');
+			}
+
 			if (text || numToolsCalled > 0) {
 				return {
 					type: ChatFetchResponseType.Success,
 					requestId,
 					serverRequestId: requestId,
-					usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } },
+					usage: resolvedUsage,
 					value: text,
 					resolvedModel: this.languageModel.id
 				};
@@ -263,6 +385,11 @@ export class ExtensionContributedChatEndpoint implements IChatEndpoint {
 				};
 			}
 		} catch (e) {
+			if (otelSpan) {
+				const message = toErrorMessage(e, true);
+				otelSpan.setStatus(SpanStatusCode.ERROR, message);
+				otelSpan.recordException(e);
+			}
 			return {
 				type: ChatFetchResponseType.Failed,
 				reason: toErrorMessage(e, true),
@@ -270,6 +397,7 @@ export class ExtensionContributedChatEndpoint implements IChatEndpoint {
 				serverRequestId: undefined
 			};
 		} finally {
+			otelSpan?.end();
 			retrieveCapturingTokenByCorrelation(ourRequestId);
 		}
 	}
